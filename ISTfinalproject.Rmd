@@ -1,0 +1,809 @@
+---
+title: "IST 687 Final Project"
+author: "Jonah Soos"
+date: "2024-11-21"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Load in Relevant Packages
+```{r}
+library(tidyverse)
+library(arrow)
+library(lubridate)
+library(stringr)
+library(car)
+library(mgcv)
+library(caret)
+library(Metrics)
+library(xgboost)
+library(fastDummies)
+```
+
+# Step 1 -- Initial Analysis of Data
+```{r}
+# Load in the Metadata
+info <- read_csv("https://intro-datascience.s3.us-east-2.amazonaws.com/SC-data/data_dictionary.csv")
+
+# Read in the Static House Information
+house_data <- read_parquet("https://intro-datascience.s3.us-east-2.amazonaws.com/SC-data/static_house_info.parquet")
+```
+
+Firstly, because the data is extremely large, we are going to sample building IDs of 500 random houses to gather overall trends and observe summary statistics for the whole year. Typically we would use the entire dataset, but due to size constraints, sampling a proportion can allow us to get general trends without certainty.
+```{r}
+# Gather all unique Building IDS
+building_ids <- unique(house_data$bldg_id)
+
+# Creates blank data frame to hold data
+energy_sample <- data.frame()
+
+# Set seed for reproducibility
+set.seed(11212024)
+
+# Sample 25 different building_ids used for initial analysis
+sample_buildings <- sample(building_ids, size = 600, replace = TRUE)
+
+# Iterate through each unique building_id in the sample
+for (i in sample_buildings) {
+  # Create the unique URL for the building
+  url <- paste0("https://intro-datascience.s3.us-east-2.amazonaws.com/SC-data/2023-houseData/", i, ".parquet")
+  
+  # Use TryCatch in case there are any timeout errors, the loop will not break
+  tryCatch({
+    # Read the parquet data
+    temp <- read_parquet(url) %>%
+      mutate(
+        # Create a column that is the building id
+        bldg_id = i,
+        # Extract the Date
+        date = as.Date(time),
+        # Extract the Month,
+        month = month(date),
+        # Extract the Time
+        timestamp = format(as.POSIXct(time), "%H:%M:%S"),
+        # Calculate per hour by selecting all columns with "electricity" in the name and summing the row
+        total_electricity = rowSums(select(., contains("electricity"))),
+        # Calculate per hour by selecting all columns with "oil" in the name and summing the row
+        total_oil = rowSums(select(., contains("oil"))),
+        # Calculate per hour by selecting all columns with "gas" in the name and summing the row
+        total_gas = rowSums(select(., contains("gas"))),
+        # Calculate per hour by selecting all columns with "propane" in the name and summing the row
+        total_propane = rowSums(select(., contains("propane"))),
+        # Sum each factor to generate total energy usage
+        total_energy_usage = total_electricity + total_gas + total_propane + total_oil
+      )  
+    
+    # Bind the data to energy_data
+    energy_sample <- rbind(energy_sample, temp)
+    
+    # Print progress of the loop
+    print(paste0("Progress: ", which(sample_buildings == i) / length(sample_buildings) * 100, "%"))
+  }, error = function(e) {
+    # Handle the error (e.g., log it and continue)
+    message(paste("Error with building ID:", i, "URL:", url, "Message:", e$message))
+  })
+}
+```
+
+Next, do some general data analysis for trends
+```{r}
+
+# Analyzing energy usage by month
+monthly <- energy_sample %>%
+  # Group the Data by month and house
+  group_by(bldg_id, month) %>%
+  # Exclude NAs for month
+  filter(!is.na(month)) %>%
+  # Calculate mean usage by month (optional if you want to include mean in the data)
+  summarise(total_energy_usage = mean(total_energy_usage, na.rm = TRUE)) %>%
+  # Create the boxplot with the data
+  ggplot(mapping = aes(x = factor(month), y = total_energy_usage)) +
+  geom_boxplot() +
+  labs(
+    title = "Monthly Energy Usage",
+    x = "Month",
+    y = "Total Energy Usage (kWh)"
+  ) +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1),
+    plot.title = element_text(face = "bold", size = 18, hjust = 0.5),
+    axis.title = element_text(face = "bold", size = 14)
+  )
+monthly
+ggsave("monthly_energy.png", plot = monthly)
+
+# Analyzing energy usage by hour
+hourly <- energy_sample %>%
+  # Group the Data by hour and house
+  group_by(bldg_id, timestamp) %>%
+  # Exclude NAs for hour
+  filter(!is.na(timestamp)) %>%
+  # Calculate mean usage by hour (optional if you want to include mean in the data)
+  summarise(total_energy_usage = mean(total_energy_usage, na.rm = TRUE)) %>%
+  # Create the boxplot with the data
+  ggplot(mapping = aes(x = factor(timestamp), y = total_energy_usage)) +
+  geom_boxplot() +
+  labs(
+    title = "Hourly Energy Usage",
+    x = "Hour",
+    y = "Total Energy Usage (kWh)"
+  ) +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1),
+    plot.title = element_text(face = "bold", size = 18, hjust = 0.5),
+    axis.title = element_text(face = "bold", size = 14)
+  )
+hourly
+ggsave("hourly_energy.png", plot = hourly)
+
+# Rank the highest and lowest contributors to energy consumption
+ranked <- energy_sample %>%
+  # summarise each energy contributor to find the mean
+  summarise(
+    across(out.electricity.ceiling_fan.energy_consumption:out.propane.range_oven.energy_consumption,
+           ~ mean(., na.rm = TRUE))
+  ) %>%
+  # Use pivot longer to turn columns into rows
+  pivot_longer(everything(), names_to = "Energy_Contributor", values_to = "Mean_Energy") %>%
+  # Exclude anything with a mean of 0
+  filter(Mean_Energy != 0) %>%
+  # Edit the names so that it takes whatever text is after electricity|propane|oil and before energy_consuption
+  mutate(
+    Energy_Contributor = gsub(".*\\.(electricity|natural_gas|propane)\\.", "", Energy_Contributor),
+    Energy_Contributor = gsub("\\.energy_consumption", "", Energy_Contributor)
+  )
+
+# Create the bar chart of the results
+ggplot(ranked, aes(x = reorder(Energy_Contributor, Mean_Energy), y = Mean_Energy)) +
+  geom_col(fill = "skyblue") +
+  coord_flip() +
+  labs(
+    title = "Mean Energy Consumption by Contributor",
+    x = "Energy Contributor",
+    y = "Mean Energy Consumption per Hour (kWh)"
+  ) +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1),
+    plot.title = element_text(face = "bold", size = 18, hjust = 0.5),
+    axis.title = element_text(face = "bold", size = 14)
+  ) -> vars
+vars
+ggsave("energy_impact.png", plot = vars)
+```
+
+
+Loading in all of the entire hourly energy data
+```{r}
+# Gather all unique Building IDS
+building_ids <- unique(house_data$bldg_id)
+
+# Creates blank data frame to hold data
+energy_data <- data.frame()
+
+# Iterate through each unique building_id
+for (i in building_ids) {
+  # Create the unique URL for the building
+  url <- paste0("https://intro-datascience.s3.us-east-2.amazonaws.com/SC-data/2023-houseData/", i, ".parquet")
+  
+  # Use TryCatch in case there are any timeout errors, the loop will not break
+  tryCatch({
+    # Read the parquet data
+    temp <- read_parquet(url) %>%
+      mutate(
+        # Create a column that is the building id
+        bldg_id = i,
+        # Extract the Date
+        date = as.Date(time),
+        # Extract the Month,
+        month = month(date),
+        # Extract the Time
+        timestamp = format(as.POSIXct(time), "%H:%M:%S"),
+        # Calculate per hour by selecting all columns with "electricity" in the name and summing the row
+        total_electricity = rowSums(select(., contains("electricity"))),
+        # Calculate per hour by selecting all columns with "oil" in the name and summing the row
+        total_oil = rowSums(select(., contains("oil"))),
+        # Calculate per hour by selecting all columns with "gas" in the name and summing the row
+        total_gas = rowSums(select(., contains("gas"))),
+        # Calculate per hour by selecting all columns with "propane" in the name and summing the row
+        total_propane = rowSums(select(., contains("propane"))),
+        # Sum each factor to generate total energy usage
+        total_energy_usage = total_electricity + total_gas + total_propane + total_oil
+      )  %>%
+      # Filter to only summer months
+      filter(month %in% (6:8)) %>%
+      # Select relevant columns
+      select(time:total_energy_usage)
+    
+    # Bind the data to energy_data
+    energy_data <- rbind(energy_data, temp)
+    
+    # Print progress of the loop
+    print(paste0("Progress: ", which(building_ids == i) / length(building_ids) * 100, "%"))
+  }, error = function(e) {
+    # Handle the error (e.g., log it and continue)
+    message(paste("Error with building ID:", i, "URL:", url, "Message:", e$message))
+  })
+}
+```
+
+
+Loading in the Weather Data
+```{r}
+# Gather each unique county
+counties <- unique(house_data$in.county)
+
+# Create a dataframe for the weather data
+weather_data <- data.frame()
+
+# Iterate through each unique building_id
+for (i in counties) {
+  # Create the unique URL for the building
+  url <- paste0("https://intro-datascience.s3.us-east-2.amazonaws.com/SC-data/weather/2023-weather-data/", i, ".csv")
+  
+  # Use TryCatch in case there are any timeout errors, the loop will not break
+  tryCatch({
+    # Read the csv data
+    temp <- read_csv(url) %>%
+      mutate(
+        # Create a column that is the building id
+        in.county = i,
+        # Extract the Date
+        date = as.Date(date_time),
+        # Extract the Month,
+        month = month(date_time),
+        # Extract the Time
+        timestamp = format(as.POSIXct(date_time), "%H:%M:%S")
+      )  
+    
+    # Bind the data to energy_data
+    weather_data <- rbind(weather_data, temp)
+    
+    # Print progress of the loop
+    print(paste0("Progress: ", which(counties == i) / length(counties) * 100, "%"))
+  }, error = function(e) {
+    # Handle the error (e.g., log it and continue)
+    message(paste("Error with building ID:", i, "URL:", url, "Message:", e$message))
+  })
+}
+
+# Save the current environment so scraping does not need to occur multiple times
+save.image("rawdata.RData")
+```
+
+
+#### Step 2 -- Creating Dataframe for Analysis
+
+Merging all data together into a dataframe
+```{r}
+
+# Merging the data
+data <- house_data %>%
+  # Use left join to merge all matching building IDs onto house_data
+  left_join(energy_data, by = c(
+    "bldg_id" = "bldg_id"
+  )) %>%
+  # Use left_join to match county ids and timestamps with weather information
+  left_join(weather_data, by = c(
+    "in.county" = "in.county",
+    "date" = "date",
+    "month" = "month",
+    "timestamp" = "timestamp"
+  ))
+write_parquet(data, "final_data.parquet")
+```
+
+If writing works properly, remove the raw data from the environment
+```{r}
+rm(energy_data, energy_sample, house_data, weather_data, temp)
+
+# Save the current environment to load in final data if neccesary
+save.image("rawdata.RData")
+```
+
+Use summary to make important takeaways
+```{r}
+summary(data)
+```
+
+Takeaways:
+```{r}
+# Upgrades and Weight are all the same, so do not include
+# House are anywhere from 1:4 Bedrooms and 318:2176 square feet
+# Location classifiers -- likely not needed because of weather data. Only 2 used (see below) where the difference can be quanitified by recorded humidity data
+table(data$in.building_america_climate_zone)
+table(data$in.census_region) # All from the same region, so no need to include
+table(data$in.city) # 16 different classifications is likely too many to include, so will exclude
+table(data$in.ceiling_fan) # 3 Different, may be interesting to look at fan usage
+table(data$in.clothes_washer) # Differences but found not to be impactful earlier. Turn into dummy
+table(data$in.clothes_dryer) # Differences but found not to be impactful earlier. Turn into dummy
+table(data$in.cooking_range) # Differences but found not to be impactful earlier. Turn into dummy
+table(data$in.cooling_setpoint) # Major differences that may impact energy, include as numeric
+table(data$in.heating_setpoint) # Major differences that may impact energy, include as numeric
+table(data$in.dishwasher) # Differences but found not to be impactful earlier. Turn into dummy
+table(data$in.electric_vehicle) # No electric vehicles, do not include
+table(data$in.geometry_stories) # Likely collinear with square feet, but include and check
+table(data$in.heating_fuel) # Some differences that may impact energy consumption, include and check later
+table(data$in.holiday_lighting) # No variation
+table(data$in.hvac_cooling_efficiency) # Likely interesting to include, since there are a lot of classifiers, use cooling_type instead
+table(data$in.hvac_heating_efficiency) # Likely interesting to include, since there are a lot of classifiers, use heating_type instead
+table(data$in.lighting) # With lighting playing a strong factor, want to include
+table(data$in.plug_loads) # All the same
+table(data$in.vacancy_status) # Interesting, may impact energy usage
+table(data$in.plug_loads) # Seen major factor previously, but zero variation, so not included
+```
+
+
+
+Edit the data to select important columns
+```{r}
+
+f_data <- data %>%
+  # Select relevant columns
+  select(
+    bldg_id, in.county,
+    # Important building parameters
+    in.sqft, in.bedrooms, in.geometry_stories, in.occupants, in.lighting, in.vacancy_status,
+    # Important appliances
+    in.ceiling_fan, in.clothes_dryer, in.clothes_washer, in.cooking_range, in.dishwasher,
+    # Cooling/heating types
+    in.cooling_setpoint, in.heating_setpoint, in.hvac_cooling_type, in.hvac_heating_type, in.heating_fuel,
+    # Demographic factors
+    in.income, 
+    # All energy columns
+    date:total_energy_usage,
+    # Weather columns
+    temperature = `Dry Bulb Temperature [°C]`, 
+    humidity = `Relative Humidity [%]`, 
+    wind = `Wind Speed [m/s]`
+  ) %>%
+  # Apply data transformations
+  mutate(
+    # Make vacancy status a factor
+    in.vacancy_status = as.factor(in.vacancy_status),
+    # Turn appliances into categorical variables
+    in.ceiling_fan = as.factor(in.ceiling_fan),
+    # Turn lighting into categorical variable
+    in.lighting = as.factor(in.lighting),
+    # Turn occupants into numeric
+    in.occupants = as.numeric(in.occupants),
+    # Separate dryer type and efficiency
+    dryer_type = as.factor(case_when(
+      str_detect(in.clothes_dryer, "Electric") ~ "Electric",
+      str_detect(in.clothes_dryer, "Gas") ~ "Gas",
+      str_detect(in.clothes_dryer, "Propane") ~ "Propane",
+      TRUE ~ "None"
+    )),
+    dryer_efficiency = case_when(
+      str_detect(in.clothes_dryer, "120%") ~ 120,
+      str_detect(in.clothes_dryer, "100%") ~ 100,
+      str_detect(in.clothes_dryer, "80%") ~ 80,
+      TRUE ~ NA_integer_
+    ),
+    # Separate washer presence and efficiency
+    is_washer = case_when(
+      str_detect(in.clothes_washer, "None") ~ 0,
+      TRUE ~ 1
+    ),
+    washer_efficiency = case_when(
+      str_detect(in.clothes_washer, "120%") ~ 120,
+      str_detect(in.clothes_washer, "100%") ~ 100,
+      str_detect(in.clothes_washer, "80%") ~ 80,
+      TRUE ~ NA_integer_
+    ),
+    # Separate stove type and efficiency
+    stove_type = as.factor(case_when(
+      str_detect(in.cooking_range, "Electric") ~ "Electric",
+      str_detect(in.cooking_range, "Gas") ~ "Gas",
+      str_detect(in.cooking_range, "Propane") ~ "Propane",
+      TRUE ~ "None"
+    )),
+    stove_efficiency = case_when(
+      str_detect(in.cooking_range, "120%") ~ 120,
+      str_detect(in.cooking_range, "100%") ~ 100,
+      str_detect(in.cooking_range, "80%") ~ 80,
+      TRUE ~ NA_integer_
+    ),
+    # Separate dishwasher presence and efficiency
+    is_dishwasher = case_when(
+      str_detect(in.dishwasher, "None") ~ 0,
+      TRUE ~ 1
+    ),
+    dishwasher_efficiency = case_when(
+      str_detect(in.dishwasher, "120%") ~ 120,
+      str_detect(in.dishwasher, "100%") ~ 100,
+      str_detect(in.dishwasher, "80%") ~ 80,
+      TRUE ~ NA_integer_
+    ),
+    
+    # Remove the "F" and extract numeric values for setpoints
+    in.cooling_setpoint = as.numeric(str_extract(in.cooling_setpoint, "\\d{2}")),
+    in.heating_setpoint = as.numeric(str_extract(in.heating_setpoint, "\\d{2}")),
+    # Convert cooling/heating types and heating fuel to factors
+    in.hvac_cooling_type = as.factor(in.hvac_cooling_type),
+    in.hvac_heating_type = as.factor(in.hvac_heating_type),
+    in.heating_fuel = as.factor(in.heating_fuel)
+  ) %>%
+  # Drop unnecessary columns
+  select(-c(in.clothes_dryer, in.clothes_washer, in.dishwasher, in.cooking_range))
+
+# Remove the older version for storage purposes
+rm(data)
+
+save.image("finaldata.RData")
+```
+
+#### Step 3 -- Modeling
+
+```{r}
+# First step is removing all identifying variables and variables used to create total_energy_usage
+
+mod_data <- f_data %>%
+  select(-c(bldg_id, in.county, date, total_electricity:total_propane)) %>%
+  mutate(
+    in.income = as.factor(in.income),
+    timestamp = as.factor(timestamp)
+  )
+
+# Next create an OLS model as the baseline
+
+# Perform train-test split
+set.seed(1232024)  # For reproducibility
+train_index <- createDataPartition(mod_data$total_energy_usage, p = 0.8, list = FALSE)
+
+# Create training and testing datasets
+train <- mod_data[train_index, ]
+test <- mod_data[-train_index, ]
+
+# Run the model with all variables
+ols_model <- lm(total_energy_usage ~ ., data = train)
+summary(ols_model)
+
+# Takeaways -- Model does not fully work because of some factors being ordered wrong and efficiency being highly colinear between appliances. That can be seen here
+
+# Filter to numeric data and create a corelation matrix
+numeric_data <- mod_data %>% select(where(is.numeric))
+cor_matrix <- cor(numeric_data, use = "pairwise.complete.obs")
+
+# Get the correlations with magnitude > 0.5
+high_corr <- as.data.frame(as.table(cor_matrix)) %>% 
+  filter(abs(Freq) > 0.5 & Var1 != Var2)  # Exclude self-correlations
+
+# Sort by descending correlation magnitude
+high_corr <- high_corr %>% arrange(desc(abs(Freq)))
+
+# Print the results
+print(high_corr)
+rm(numeric_data)
+
+# Knowing this, we can include only an overall efficiency metric and reorder some of the factors perviously (so that none is the excluded factor)
+
+mod_data <- mod_data %>%
+  mutate(
+    # Create appliance efficiency (can equal any specific one since all are equal)
+    appliance_efficiency = dryer_efficiency,
+    # Reordering certain factors
+    in.hvac_heating_type = relevel(mod_data$in.hvac_heating_type, ref = "None"),
+    in.heating_fuel = relevel(mod_data$in.heating_fuel, ref = "None"),
+    in.income = relevel(mod_data$in.income, ref = "<10000"),
+    stove_type = relevel(mod_data$stove_type, ref = "None"),
+  ) %>%
+  select(-c(washer_efficiency, dryer_efficiency, dishwasher_efficiency, stove_efficiency))
+
+# Now with this dataset, we can rerun the OLS model
+train <- mod_data[train_index, ]
+test <- mod_data[-train_index, ]
+
+# Run the model with all variables
+ols_model <- lm(total_energy_usage ~ ., data = train)
+summary(ols_model)
+
+# Now, It can be seen heating type and heating fuel are collinear as well as there being a washer and dryer. So we can drop is_washer and see which of heating fuel and hvac heating has a larger impact on the model
+mod_data <- mod_data %>% select(-is_washer)
+
+# Find impact of in.hvac_heating_type
+hvac <- lm(total_energy_usage ~ in.hvac_heating_type, mod_data)
+summary(hvac)
+# Find impact of in.heating_fuel
+fuel <- lm(total_energy_usage ~ in.heating_fuel, mod_data)
+summary(fuel)
+
+# Both contain sigularities and both have minimal impact, so choosing to not include either
+mod_data <- mod_data %>% select(-in.heating_fuel, -in.hvac_heating_type,
+                                # Also removing income as a variable as its nature of factor makes                                             conclusions nearly impossible to disentangle
+                                -in.income)
+
+# Resplit the data
+train <- mod_data[train_index, ]
+test <- mod_data[-train_index, ]
+
+# Fix Error in Dryer Type
+test$dryer_type <- ifelse(test$dryer_type == "None", "Unknown", as.character(test$dryer_type))
+test$dryer_type <- factor(test$dryer_type, levels = levels(train$dryer_type))
+
+# Run the model with all variables
+ols_model <- lm(total_energy_usage ~ ., data = train)
+summary(ols_model)
+vif(ols_model) # Check for multicollinearity
+
+# Predict using the model to compute the RMSE
+test$predicted <- predict(ols_model, newdata = test)
+
+# Filter out NAs
+test <- test %>%
+  filter(!is.na(total_energy_usage & predicted))
+ols_RMSE <- Metrics::rmse(test$total_energy_usage, test$predicted)
+print(ols_RMSE)
+
+save.image("mod.RData")
+```
+
+The base RMSE we can try and top is 0.5913. Lets first try dropping the linearity assumption using a GAM model to look for smooth relationships between regressors and independent variable
+
+```{r}
+# Fit a GAM model with smooth terms for continuous predictors with custom degrees of freedom to make sure there are not more than the number of different values
+sapply(train, function(x) length(unique(x)))
+
+gam_model <- gam(total_energy_usage ~ 
+                 s(in.sqft, k = 8) + s(in.bedrooms, k = 4) + s(in.geometry_stories, k = 2) + 
+                 s(in.occupants, k = 9) + factor(in.lighting) + 
+                 factor(in.vacancy_status) + factor(in.ceiling_fan) +
+                 s(in.cooling_setpoint, k = 10) + s(in.heating_setpoint, k = 11) + 
+                 factor(in.hvac_cooling_type) + month + factor(timestamp) + 
+                 s(temperature) + s(humidity) + s(wind) + 
+                 factor(dryer_type) + factor(stove_type) + is_dishwasher +
+                 s(appliance_efficiency, k = 3), 
+                 data = train)
+
+# Summary of the GAM model
+summary(gam_model)
+
+# Predict using the GAM model
+test$predicted_gam <- predict(gam_model, newdata = test)
+
+# Calculate RMSE (ensure there are no NA values in predictions)
+rmse_gam <- rmse(test$total_energy_usage[!is.na(test$total_energy_usage)],
+                   test$predicted_gam[!is.na(test$predicted_gam)])
+
+# Print RMSE
+print(rmse_gam)
+save.image("mod.RData")
+
+```
+
+```{r}
+plot(gam_model, pages = 10, se = TRUE, rug = TRUE, ylab = "Impact on Energy Usage", ylim = c(-2, 2))
+```
+
+Test a XGBoost model for Machine Learning
+
+```{r}
+# Turn all categorical variables to dummies for machine learning
+train_processed <- train %>%
+  dummy_cols(remove_first_dummy = TRUE, remove_selected_columns = TRUE)
+
+test_processed <- test %>%
+  dummy_cols(remove_first_dummy = TRUE, remove_selected_columns = TRUE)
+
+# Keep only the columns in test_processed that are also in train_processed
+common_columns <- intersect(names(train_processed), names(test_processed))
+test_processed <- test_processed[, common_columns]
+
+# Create xgb matrices for the data, used to train and test using the xgboost package
+dtrain <- xgb.DMatrix(as.matrix(select(train_processed, -total_energy_usage)),
+                          label = train$total_energy_usage)
+dtest <- xgb.DMatrix(as.matrix(select(test_processed, -total_energy_usage)),
+                          label = test$total_energy_usage)
+
+rm(train_processed, test_processed)
+
+# Set the parameters to default
+params <- list(
+  objective = "reg:squarederror",  # For regression
+  eval_metric = "rmse",           # Root Mean Squared Error
+  eta = 0.05                       # Learning rate
+)
+
+# Run the XGBoost Model
+xgb_model <- xgb.train(
+  params = params,
+  data = dtrain,
+  nrounds = 100,          # Number of boosting rounds
+  watchlist = list(train = dtrain, test = dtest),  # Monitor training and testing
+  verbose = 1             # Show training progress
+)
+
+xgb_rmse <- min(xgb_model$evaluation_log$test_rmse)
+```
+
+The XGBoost model comes in similar RMSE, if not slightly better, but loses the intuitiveness component of understandable statistically backed takeaways. For that reason, the marginal benefit is not worth the loss of intuitiveness.
+
+#### Step 4 -- Peak Energy Demand
+
+```{r}
+# Create a dataset for the month of july with temperature 5 degrees warmer
+rm(train, test)
+
+future_energy <- f_data %>%
+  # Filter to July
+  filter(month == 7) %>%
+  # Make all Temps 5 degrees warmer
+  mutate(temperature = temperature + 5) %>%
+  # Remove the previous energy usage
+  select(-total_energy_usage) %>%
+  # Make the changes above
+  mutate(
+    # Create appliance efficiency (can equal any specific one since all are equal)
+    appliance_efficiency = dryer_efficiency,
+    timestamp = as.factor(timestamp)
+  ) 
+
+# Predict Energy for the new dataset
+future_energy$total_energy_usage <- predict(gam_model, newdata = future_energy)
+write_parquet(future_energy, "future_energy.parquet")
+
+# Aggregate by day to find peak daily demand
+future_hourly_demand <- future_energy %>%
+  group_by(timestamp) %>%
+  summarise(future_energy_usage = sum(total_energy_usage, na.rm = TRUE))
+
+# Aggregate current demand usage to compare
+current_hourly_demand <- f_data %>%
+  filter(month == 7) %>%
+  group_by(timestamp) %>%
+  summarise(current_energy_usage = sum(total_energy_usage, na.rm = TRUE))
+
+# Join data sets and calculate the percent change per hour
+demand <- current_hourly_demand %>%
+  left_join(future_hourly_demand, by=c("timestamp")) %>%
+  mutate(
+    pct_change = (future_energy_usage - current_energy_usage) / current_energy_usage
+  )
+
+# Reshape the data to long format
+demand_long <- demand %>%
+  pivot_longer(cols = c(current_energy_usage, future_energy_usage),
+               names_to = "energy_type",
+               values_to = "energy_usage")
+
+# Create the bar graph with side-by-side bars
+ggplot(demand_long, aes(x = timestamp, y = energy_usage, fill = energy_type)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.4) +  # Side-by-side bars
+  scale_fill_manual(
+    name = "Energy Type",
+    values = c("current_energy_usage" = "blue", "future_energy_usage" = "red")
+  ) +
+  labs(
+    title = "Current vs. Future Energy Usage by Time",
+    x = "Timestamp",
+    y = "Energy Usage",
+    fill = "Energy Type"
+  ) +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1),
+    plot.title = element_text(face = "bold", size = 18, hjust = 0.5),
+    axis.title = element_text(face = "bold", size = 14))
+
+```
+
+Evaluating Peak Energy Demand by different variables
+
+```{r}
+# Demand by County
+
+# Evaluate Future County Demand
+cf_demand <- future_energy %>%
+  group_by(in.county) %>%
+  summarise(future_energy_usage = sum(total_energy_usage, na.rm = TRUE))
+
+# Evaluate Current County Demand
+cc_demand <- f_data %>%
+  filter(month == 7) %>%
+  group_by(in.county) %>%
+  summarise(current_energy_usage = sum(total_energy_usage, na.rm = TRUE))
+
+# Join data sets
+c_demand <- cc_demand %>%
+  left_join(cf_demand, by=c("in.county"))
+
+# Reshape the data to long format
+c_demand_long <- c_demand %>%
+  pivot_longer(cols = c(current_energy_usage, future_energy_usage),
+               names_to = "energy_type",
+               values_to = "energy_usage")
+
+# Create the bar graph with side-by-side bars
+ggplot(c_demand_long, aes(x = in.county, y = energy_usage, fill = energy_type)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.4) +  # Side-by-side bars
+  scale_fill_manual(
+    name = "Energy Type",
+    values = c("current_energy_usage" = "blue", "future_energy_usage" = "red")
+  ) +
+  labs(
+    title = "Current vs. Future Energy Usage by County",
+    x = "Timestamp",
+    y = "Energy Usage",
+    fill = "Energy Type"
+  ) +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1),
+    plot.title = element_text(face = "bold", size = 18, hjust = 0.5),
+    axis.title = element_text(face = "bold", size = 14))
+
+# Demand by Occupants
+
+# Evaluate Future County Demand
+of_demand <- future_energy %>%
+  group_by(in.occupants) %>%
+  summarise(future_energy_usage = sum(total_energy_usage, na.rm = TRUE))
+
+# Evaluate Current County Demand
+oc_demand <- f_data %>%
+  filter(month == 7) %>%
+  group_by(in.occupants) %>%
+  summarise(current_energy_usage = sum(total_energy_usage, na.rm = TRUE))
+
+# Join data sets
+o_demand <- oc_demand %>%
+  left_join(of_demand, by=c("in.occupants"))
+
+# Reshape the data to long format
+o_demand_long <- o_demand %>%
+  pivot_longer(cols = c(current_energy_usage, future_energy_usage),
+               names_to = "energy_type",
+               values_to = "energy_usage")
+
+# Create the bar graph with side-by-side bars
+ggplot(o_demand_long, aes(x = in.occupants, y = energy_usage, fill = energy_type)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.4) +  # Side-by-side bars
+  scale_fill_manual(
+    name = "Energy Type",
+    values = c("current_energy_usage" = "blue", "future_energy_usage" = "red")
+  ) +
+  labs(
+    title = "Current vs. Future Energy Usage by Occupants",
+    x = "Occupants",
+    y = "Energy Usage",
+    fill = "Energy Type"
+  ) +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1),
+    plot.title = element_text(face = "bold", size = 18, hjust = 0.5),
+    axis.title = element_text(face = "bold", size = 14))
+```
+
+Stargazer output of GAM Final Model
+```{r}
+library(mgcv)
+library(stargazer)
+# Generate summary statistics from the GAM model
+gam_summary <- summary(gam_model)
+
+# Extract coefficients and standard errors
+coefficients <- gam_summary$p.table
+smooth_terms <- gam_summary$s.table
+
+# Create a table with parametric terms
+stargazer(coefficients, 
+          type = "html", 
+          summary = FALSE, 
+          title = "Parametric Coefficients for GAM Model",
+          out = "gam_parametric_coefficients.html")
+
+# Optional: Create a separate table for smooth terms
+cat("\nSmooth Terms:\n")
+stargazer(smooth_terms, 
+          type = "html", 
+          summary = FALSE, 
+          title = "Smooth Terms for GAM Model",
+          out = "gam_smooth_terms.html")
+```
+
